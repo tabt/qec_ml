@@ -80,17 +80,21 @@ class LeakageDetectorCNN(nn.Module):
         self.w = distance
         self.rounds = rounds
 
-        # Spatial feature extractor (shared across rounds)
+        # Spatial feature extractor (shared across rounds).
+        # Fix: GlobalAvgPool (1x1) instead of (2x2) — the 4x5 grid is already
+        # small; aggressive pooling destroys the localised dark-detector signal.
         self.spatial = nn.Sequential(
             nn.Conv2d(1, base_channels, 3, padding=1),
             nn.BatchNorm2d(base_channels), nn.GELU(),
-            nn.Conv2d(base_channels, base_channels, 3, padding=1),
-            nn.BatchNorm2d(base_channels), nn.GELU(),
-            nn.AdaptiveAvgPool2d(2),   # → (B*R, C, 2, 2)
+            nn.Conv2d(base_channels, base_channels * 2, 3, padding=1),
+            nn.BatchNorm2d(base_channels * 2), nn.GELU(),
+            nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1),
+            nn.BatchNorm2d(base_channels * 2), nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),   # global avg → (B*R, C*2, 1, 1)
         )
 
-        # Temporal feature extractor (across rounds)
-        spatial_out_dim = base_channels * 4   # 2x2 pool
+        # Temporal feature extractor: one vector per round, conv across time.
+        spatial_out_dim = base_channels * 2
         self.temporal = nn.Sequential(
             nn.Conv1d(spatial_out_dim, base_channels * 2, kernel_size=3, padding=1),
             nn.GELU(),
@@ -101,10 +105,10 @@ class LeakageDetectorCNN(nn.Module):
 
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(base_channels * 2, base_channels),
+            nn.Linear(base_channels * 2, base_channels * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(base_channels, 1),  # binary: leakage or not
+            nn.Linear(base_channels * 2, 1),
         )
 
     def forward(self, syndrome: torch.Tensor) -> torch.Tensor:
@@ -121,24 +125,28 @@ class LeakageDetectorCNN(nn.Module):
         R, H, W = self.rounds, self.h, self.w
         n_use = R * H * W
 
-        # Pad/crop to fit grid
-        s = syndrome[:, :n_use]
-        if s.shape[1] < n_use:
-            pad = torch.zeros(B, n_use - s.shape[1], device=syndrome.device)
-            s = torch.cat([s, pad], dim=1)
+        # Pad to n_use (use ALL bits, pad if syndrome is shorter)
+        if syndrome.shape[1] < n_use:
+            pad = torch.zeros(B, n_use - syndrome.shape[1], device=syndrome.device)
+            s = torch.cat([syndrome, pad], dim=1)
+        else:
+            # Take exactly n_use bits; if syndrome is longer, use first n_use
+            # (remaining bits are the padded ancilla bits from spatial dataset)
+            s = syndrome[:, :n_use]
 
-        # Reshape: (B, R, H, W)
-        grid = s.reshape(B, R, H, W)
+        # Reshape: (B, R, H, W) — contiguous() ensures valid reshape
+        grid = s.contiguous().reshape(B, R, H, W)
 
-        # Apply spatial conv to each round independently
-        # Reshape to (B*R, 1, H, W)
+        # Apply spatial conv to each round independently: (B*R, 1, H, W)
         grid_flat = grid.reshape(B * R, 1, H, W)
-        spatial_feat = self.spatial(grid_flat)          # (B*R, C, 2, 2)
-        spatial_feat = spatial_feat.reshape(B, R, -1)      # (B, R, C*4)
-        spatial_feat = spatial_feat.permute(0, 2, 1)    # (B, C*4, R)
+        spatial_feat = self.spatial(grid_flat)            # (B*R, C*2, 1, 1)
+        # Squeeze spatial dims, reshape to (B, R, C*2)
+        spatial_feat = spatial_feat.squeeze(-1).squeeze(-1)   # (B*R, C*2)
+        spatial_feat = spatial_feat.reshape(B, R, -1)         # (B, R, C*2)
+        spatial_feat = spatial_feat.permute(0, 2, 1)          # (B, C*2, R)
 
         # Temporal conv across rounds
-        temporal_feat = self.temporal(spatial_feat)     # (B, C*2, 1)
+        temporal_feat = self.temporal(spatial_feat)            # (B, C*2, 1)
 
         return self.head(temporal_feat).squeeze(-1)
 
