@@ -1,26 +1,47 @@
 """
 qec_ml.models
 ==============
-ML decoders for quantum error correction.
+ML decoders and detectors for quantum error correction.
 
-Available models
-----------------
-MLP
-    SyndromeTransformer — Transformer encoder over syndrome bits
-    SpatialTemporalTransformer — 2D spatial + temporal Transformer
-    MLPDecoder — fully-connected baseline
-    CNNDecoder — 2D-CNN with residual blocks
-    GCNDecoder — Graph Convolutional Network (requires torch-geometric)
-    GATDecoder — Graph Attention Network (requires torch-geometric)
-    LSTMClassifier — Bidirectional LSTM for IQ time series
-    Conv1DClassifier — Dilated 1D-CNN for IQ time series
-    IQAutoencoder — Convolutional autoencoder for IQ denoising
+v1 baselines
+------------
+MLPDecoder, CNNDecoder
+SyndromeTransformer, SpatialTemporalTransformer
+LSTMClassifier, Conv1DClassifier, IQAutoencoder
+
+v2 improved models
+------------------
+ResidualMLP         — MLP with residual blocks + syndrome features
+SurfaceCodeCNN      — CNN with physically correct (d-1)×d ancilla layout
+AncillaTransformer  — Transformer with 2D row/col/round positional encodings
+FocalLoss           — loss for imbalanced syndrome datasets
+
+v3 leakage & GNN
+-----------------
+LeakageDetectorCNN              — spatio-temporal CNN for dark-detector detection
+LeakageClassifierTransformer    — multi-task: logical error + leakage jointly
+SyndromeAnomalyDetector         — unsupervised autoencoder anomaly detector
+
+Optional (requires torch-geometric)
+------------------------------------
+GCNDecoder, GATDecoder
 """
 
+# v1
 from qec_ml.models.mlp_decoder import MLPDecoder, CNNDecoder
 from qec_ml.models.transformer_decoder import SyndromeTransformer, SpatialTemporalTransformer
 from qec_ml.models.lstm_corrector import LSTMClassifier, Conv1DClassifier, IQAutoencoder
 
+# v2
+from qec_ml.models.mlp_decoder import ResidualMLP, SurfaceCodeCNN, FocalLoss
+from qec_ml.models.transformer_decoder import AncillaTransformer
+
+# v3
+from qec_ml.models.leakage_detector import (
+    LeakageDetectorCNN, LeakageClassifierTransformer, SyndromeAnomalyDetector,
+)
+
+# Optional GNN (torch-geometric)
 try:
     from qec_ml.models.gnn_decoder import GCNDecoder, GATDecoder
     _GNN_AVAILABLE = True
@@ -28,17 +49,11 @@ except ImportError:
     _GNN_AVAILABLE = False
 
 __all__ = [
-    "MLPDecoder",
-    "CNNDecoder",
-    "SyndromeTransformer",
-    "SpatialTemporalTransformer",
-    "LSTMClassifier",
-    "Conv1DClassifier",
-    "IQAutoencoder",
-    "GCNDecoder",
-    "GATDecoder",
+    "MLPDecoder", "CNNDecoder",
+    "SyndromeTransformer", "SpatialTemporalTransformer",
+    "LSTMClassifier", "Conv1DClassifier", "IQAutoencoder",
+    "ResidualMLP", "SurfaceCodeCNN", "FocalLoss",
+    "AncillaTransformer",
+    "LeakageDetectorCNN", "LeakageClassifierTransformer", "SyndromeAnomalyDetector",
+    "GCNDecoder", "GATDecoder",
 ]
-
-# v2 improved models
-from qec_ml.models.mlp_decoder import ResidualMLP, SurfaceCodeCNN, FocalLoss
-from qec_ml.models.transformer_decoder import AncillaTransformer
