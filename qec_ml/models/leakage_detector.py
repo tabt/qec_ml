@@ -128,13 +128,13 @@ class LeakageDetectorCNN(nn.Module):
             s = torch.cat([s, pad], dim=1)
 
         # Reshape: (B, R, H, W)
-        grid = s.view(B, R, H, W)
+        grid = s.reshape(B, R, H, W)
 
         # Apply spatial conv to each round independently
         # Reshape to (B*R, 1, H, W)
-        grid_flat = grid.view(B * R, 1, H, W)
+        grid_flat = grid.reshape(B * R, 1, H, W)
         spatial_feat = self.spatial(grid_flat)          # (B*R, C, 2, 2)
-        spatial_feat = spatial_feat.view(B, R, -1)      # (B, R, C*4)
+        spatial_feat = spatial_feat.reshape(B, R, -1)      # (B, R, C*4)
         spatial_feat = spatial_feat.permute(0, 2, 1)    # (B, C*4, R)
 
         # Temporal conv across rounds
