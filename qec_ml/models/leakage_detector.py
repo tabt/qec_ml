@@ -1,217 +1,171 @@
 """
 qec_ml.models.leakage_detector
 ================================
-ML models for leakage detection and classification.
+ML models for leakage detection.
 
-Task framing
-------------
-Given a spatio-temporal syndrome pattern, predict:
-  - Binary: is there a leakage event in this shot? (detection)
-  - 3-class: no error / Pauli logical error / leakage event (classification)
-
-The key signal for leakage is the "dark detector" pattern:
-  - In normal operation, ancilla detectors fire stochastically
-  - A leaked data qubit SILENCES all adjacent ancillas for the
-    entire duration of the leakage
-  - This creates a spatially localised, temporally persistent
-    region of zeros in the syndrome — unlike Pauli errors which
-    produce isolated syndrome flips
-
-Models in this module
----------------------
-LeakageDetectorCNN
-    2D+time CNN that recognises dark-detector spatial patterns.
-    Input: (B, R, H, W) syndrome grid.
-    Output: binary leakage flag logit.
-
-LeakageClassifierTransformer
-    Transformer that jointly predicts logical error and leakage class.
-    Uses the AncillaTransformer backbone with a multi-task head.
-
-SyndromeAnomalyDetector
-    Unsupervised approach: train an autoencoder on normal (no-leakage)
-    syndromes, then use reconstruction error as anomaly score.
-    High reconstruction error → likely leakage (out-of-distribution).
+v2 key changes
+--------------
+- LeakageDetectorCNN now takes (N, R, H, W) directly — temporal structure
+  is preserved as the channel/time dimension, not flattened away
+- PersistenceMLP: simple MLP on the persistence_map feature
+  (hand-engineered: per-ancilla max consecutive-zero streak)
+  This is interpretable and often the strongest baseline
+- LeakageClassifierTransformer: unchanged, still multi-task
+- SyndromeAnomalyDetector: unchanged
 """
-
 from __future__ import annotations
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
 
-# ======================================================================
-# LeakageDetectorCNN
-# ======================================================================
+class PersistenceMLP(nn.Module):
+    """
+    MLP that classifies leakage from the persistence_map feature.
+
+    persistence_map[i, a] = max consecutive rounds that ancilla a
+    was silent (zero) during shot i.  This is the hand-engineered
+    leakage signal: a normal shot has persistence ~0-1 everywhere,
+    a leaked shot has persistence >= 2-3 near the leaked qubit.
+
+    This is intentionally simple and interpretable — it serves as
+    the strong baseline that confirms the feature is meaningful
+    before applying more complex models to the raw syndrome.
+
+    Input:  (B, n_ancilla) persistence map
+    Output: (B,) binary logit
+    """
+    def __init__(self, n_ancilla: int, hidden: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_ancilla, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),    nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, n_ancilla) float"""
+        return self.net(x).squeeze(-1)
+
 
 class LeakageDetectorCNN(nn.Module):
     """
-    2D convolutional leakage detector.
+    Spatio-temporal CNN for leakage detection.
 
-    Processes the syndrome as a (rounds × H × W) video, where each
-    frame is one round of ancilla measurements.  Temporal convolutions
-    across rounds capture the "persistence" that characterises leakage.
+    Input: (B, R, H, W) round-by-round syndrome grid.
+         NOT the flat syndrome — callers must reshape first.
+         Use LeakageDataset.round_syndromes for this.
+
+    The temporal dimension R is treated as the channel axis in a
+    3D conv: the conv kernel slides spatially (H, W) while seeing
+    all R rounds at once, learning the persistence pattern directly.
 
     Architecture
     ------------
-    Spatial branch:  2D conv on each round independently
-    Temporal branch: 1D conv across rounds per spatial position
-    Joint:           concatenated features → MLP → binary logit
-
-    Parameters
-    ----------
-    distance : int
-    rounds : int
-    base_channels : int
-    dropout : float
+    (B, R, H, W)
+      → Conv2d(R→C, 3×3)           — spatial features across all rounds
+      → [ResBlocks]
+      → GlobalAvgPool
+      → MLP → (B,)
     """
-
     def __init__(
         self,
         distance: int = 5,
-        rounds: int = 5,
-        base_channels: int = 32,
-        dropout: float = 0.1,
+        rounds:   int = 5,
+        base_channels: int = 64,
+        n_blocks: int = 4,
+        dropout:  float = 0.1,
     ):
         super().__init__()
         self.h = distance - 1
         self.w = distance
         self.rounds = rounds
 
-        # Spatial feature extractor (shared across rounds).
-        # Fix: GlobalAvgPool (1x1) instead of (2x2) — the 4x5 grid is already
-        # small; aggressive pooling destroys the localised dark-detector signal.
-        self.spatial = nn.Sequential(
-            nn.Conv2d(1, base_channels, 3, padding=1),
+        # Treat rounds as input channels — the network sees all rounds
+        # simultaneously and learns persistence patterns across them
+        self.stem = nn.Sequential(
+            nn.Conv2d(rounds, base_channels, 3, padding=1),
             nn.BatchNorm2d(base_channels), nn.GELU(),
-            nn.Conv2d(base_channels, base_channels * 2, 3, padding=1),
-            nn.BatchNorm2d(base_channels * 2), nn.GELU(),
-            nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1),
-            nn.BatchNorm2d(base_channels * 2), nn.GELU(),
-            nn.AdaptiveAvgPool2d(1),   # global avg → (B*R, C*2, 1, 1)
         )
-
-        # Temporal feature extractor: one vector per round, conv across time.
-        spatial_out_dim = base_channels * 2
-        self.temporal = nn.Sequential(
-            nn.Conv1d(spatial_out_dim, base_channels * 2, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv1d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool1d(1),
-        )
-
+        self.blocks = nn.ModuleList([
+            _ResCNNBlock(base_channels, dropout) for _ in range(n_blocks)
+        ])
         self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(base_channels * 2, base_channels * 2),
+            nn.Linear(base_channels, base_channels),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(base_channels * 2, 1),
+            nn.Linear(base_channels, 1),
         )
 
-    def forward(self, syndrome: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Parameters
-        ----------
-        syndrome : (B, syndrome_length) flat syndrome
-
-        Returns
-        -------
-        logits : (B,) — positive = leakage predicted
+        x: (B, R, H, W) — round-structured syndrome grid
+           OR (B, syndrome_length) flat — will be auto-reshaped
         """
-        B = syndrome.shape[0]
-        R, H, W = self.rounds, self.h, self.w
-        n_use = R * H * W
+        if x.dim() == 2:
+            B = x.shape[0]
+            n_use = self.rounds * self.h * self.w
+            s = x[:, :n_use]
+            if s.shape[1] < n_use:
+                s = F.pad(s, (0, n_use - s.shape[1]))
+            x = s.reshape(B, self.rounds, self.h, self.w)
 
-        # Pad to n_use (use ALL bits, pad if syndrome is shorter)
-        if syndrome.shape[1] < n_use:
-            pad = torch.zeros(B, n_use - syndrome.shape[1], device=syndrome.device)
-            s = torch.cat([syndrome, pad], dim=1)
-        else:
-            # Take exactly n_use bits; if syndrome is longer, use first n_use
-            # (remaining bits are the padded ancilla bits from spatial dataset)
-            s = syndrome[:, :n_use]
-
-        # Reshape: (B, R, H, W) — contiguous() ensures valid reshape
-        grid = s.contiguous().reshape(B, R, H, W)
-
-        # Apply spatial conv to each round independently: (B*R, 1, H, W)
-        grid_flat = grid.reshape(B * R, 1, H, W)
-        spatial_feat = self.spatial(grid_flat)            # (B*R, C*2, 1, 1)
-        # Squeeze spatial dims, reshape to (B, R, C*2)
-        spatial_feat = spatial_feat.squeeze(-1).squeeze(-1)   # (B*R, C*2)
-        spatial_feat = spatial_feat.reshape(B, R, -1)         # (B, R, C*2)
-        spatial_feat = spatial_feat.permute(0, 2, 1)          # (B, C*2, R)
-
-        # Temporal conv across rounds
-        temporal_feat = self.temporal(spatial_feat)            # (B, C*2, 1)
-
-        return self.head(temporal_feat).squeeze(-1)
+        x = self.stem(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.head(x).squeeze(-1)
 
 
-# ======================================================================
-# LeakageClassifierTransformer  (multi-task)
-# ======================================================================
+class _ResCNNBlock(nn.Module):
+    def __init__(self, ch, dropout):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(ch), nn.GELU(), nn.Dropout2d(dropout),
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(ch),
+        )
+        self.act = nn.GELU()
+    def forward(self, x): return self.act(x + self.block(x))
+
 
 class LeakageClassifierTransformer(nn.Module):
     """
-    Transformer with two output heads:
-      1. Logical error prediction (binary)
-      2. Leakage detection (binary)
-
-    Both tasks share the Transformer encoder — the shared representation
-    benefits from multi-task learning: leakage context helps correct
-    Pauli error decoding, and vice versa.
-
-    Parameters
-    ----------
-    distance, rounds, d_model, n_heads, n_layers, dropout : standard
+    Transformer with two output heads: logical error + leakage.
+    Uses 2D spatial + temporal positional embeddings.
+    Input: (B, syndrome_length) flat syndrome.
     """
-
-    def __init__(
-        self,
-        distance: int = 5,
-        rounds: int = 5,
-        d_model: int = 128,
-        n_heads: int = 8,
-        n_layers: int = 6,
-        dropout: float = 0.1,
-    ):
+    def __init__(self, distance=5, rounds=5, d_model=128, n_heads=8,
+                 n_layers=6, dropout=0.1):
         super().__init__()
         self.h = distance - 1
         self.w = distance
         self.rounds = rounds
         self.n_ancilla = self.h * self.w
 
-        # Token embedding
-        self.token_embed = nn.Embedding(2, d_model)
+        self.token_embed  = nn.Embedding(2, d_model)
+        self.row_embed    = nn.Embedding(self.h,  d_model)
+        self.col_embed    = nn.Embedding(self.w,  d_model)
+        self.round_embed  = nn.Embedding(rounds,  d_model)
+        self.cls_token    = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
-        # 2D + temporal positional embeddings (same as AncillaTransformer)
-        self.row_embed   = nn.Embedding(self.h, d_model)
-        self.col_embed   = nn.Embedding(self.w, d_model)
-        self.round_embed = nn.Embedding(rounds, d_model)
-        self.cls_token   = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=4*d_model,
             dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=n_layers, norm=nn.LayerNorm(d_model)
-        )
-
-        # Two separate heads
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers,
+                                             norm=nn.LayerNorm(d_model))
         def _head():
             return nn.Sequential(
-                nn.Linear(d_model, d_model // 2), nn.GELU(),
-                nn.Dropout(dropout), nn.Linear(d_model // 2, 1),
+                nn.Linear(d_model, d_model//2), nn.GELU(),
+                nn.Dropout(dropout), nn.Linear(d_model//2, 1),
             )
-        self.logical_head  = _head()   # P(logical error)
-        self.leakage_head  = _head()   # P(leakage event)
+        self.logical_head = _head()
+        self.leakage_head = _head()
 
-        # Precompute positional indices
         rows, cols, rnds = [], [], []
         for r in range(rounds):
             for i in range(self.h):
@@ -222,95 +176,41 @@ class LeakageClassifierTransformer(nn.Module):
         self.register_buffer("_rnds", torch.tensor(rnds, dtype=torch.long))
 
     def forward(self, syndrome: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        syndrome : (B, syndrome_length)
-
-        Returns
-        -------
-        logical_logits  : (B,)
-        leakage_logits  : (B,)
-        """
         B = syndrome.shape[0]
         n_tok = self.rounds * self.n_ancilla
-
         s = syndrome[:, :n_tok].long()
         if s.shape[1] < n_tok:
-            pad = torch.zeros(B, n_tok - s.shape[1], dtype=torch.long, device=s.device)
-            s = torch.cat([s, pad], dim=1)
-
+            s = F.pad(s, (0, n_tok - s.shape[1]))
         tok = self.token_embed(s)
         pos = (self.row_embed(self._rows)
                + self.col_embed(self._cols)
                + self.round_embed(self._rnds))
         tok = tok + pos.unsqueeze(0)
-
         cls = self.cls_token.expand(B, -1, -1)
         tok = torch.cat([cls, tok], dim=1)
-        out = self.encoder(tok)
-        cls_out = out[:, 0]   # (B, d_model)
+        out = self.encoder(tok)[:, 0]
+        return self.logical_head(out).squeeze(-1), self.leakage_head(out).squeeze(-1)
 
-        return (
-            self.logical_head(cls_out).squeeze(-1),
-            self.leakage_head(cls_out).squeeze(-1),
-        )
-
-
-# ======================================================================
-# SyndromeAnomalyDetector  (unsupervised)
-# ======================================================================
 
 class SyndromeAnomalyDetector(nn.Module):
-    """
-    Convolutional autoencoder trained on *normal* (no-leakage) syndromes.
-
-    At inference time, syndromes with leakage produce high reconstruction
-    error because they contain out-of-distribution "dark" patterns.
-
-    This is the *unsupervised* approach: no leakage labels needed for
-    training.  The anomaly score is the per-sample MSE reconstruction loss.
-
-    Parameters
-    ----------
-    syndrome_length : int
-    latent_dim : int     — bottleneck dimension
-    hidden_dim : int
-    """
-
-    def __init__(
-        self,
-        syndrome_length: int,
-        latent_dim: int = 32,
-        hidden_dim: int = 128,
-    ):
+    """Autoencoder trained on normal syndromes; high recon error = leakage."""
+    def __init__(self, syndrome_length, latent_dim=32, hidden_dim=128):
         super().__init__()
-        self.syndrome_length = syndrome_length
-
-        # Encoder: syndrome → latent
         self.encoder = nn.Sequential(
             nn.Linear(syndrome_length, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),       nn.GELU(),
             nn.Linear(hidden_dim, latent_dim),
         )
-        # Decoder: latent → syndrome
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, syndrome_length), nn.Sigmoid(),
+            nn.Linear(latent_dim,  hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim,  hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim,  syndrome_length), nn.Sigmoid(),
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        (reconstructed, latent) : shapes (B, L) and (B, latent_dim)
-        """
+    def forward(self, x):
         z = self.encoder(x)
-        recon = self.decoder(z)
-        return recon, z
+        return self.decoder(z), z
 
-    def anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-sample reconstruction MSE — high score → likely leakage."""
+    def anomaly_score(self, x):
         recon, _ = self.forward(x)
         return F.mse_loss(recon, x, reduction="none").mean(dim=1)
